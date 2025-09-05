@@ -1,0 +1,316 @@
+function varargout = ODMR(varargin)
+% ODMR MATLAB code for ODMR.fig
+% Single-instance GUIDE GUI for CW-ODMR sweep acquisition.
+%
+% This version implements:
+% - Per-point dwell time (stabilization at each frequency).
+% - Session-based DAQ with Rate + DurationInSeconds (portable).
+% - Efficient plotting by updating YData only (no full replot each time).
+% - Graceful resource cleanup on GUI close (MW OFF, TCP closed, DAQ released).
+% - First sample acquired at the start frequency before stepping (*TRG).
+% - FFT removed; per-point signal = time-domain mean(data).
+
+% Last Modified: 05-Sep-2025 (refactor per Kang's requests)
+
+% Begin initialization code - DO NOT EDIT
+gui_Singleton = 1;
+gui_State = struct('gui_Name',       mfilename, ...
+                   'gui_Singleton',  gui_Singleton, ...
+                   'gui_OpeningFcn', @ODMR_OpeningFcn, ...
+                   'gui_OutputFcn',  @ODMR_OutputFcn, ...
+                   'gui_LayoutFcn',  [] , ...
+                   'gui_Callback',   []);
+if nargin && ischar(varargin{1})
+    gui_State.gui_Callback = str2func(varargin{1});
+end
+
+if nargout
+    [varargout{1:nargout}] = gui_mainfcn(gui_State, varargin{:});
+else
+    gui_mainfcn(gui_State, varargin{:});
+end
+% End initialization code - DO NOT EDIT
+
+
+% --- Executes just before ODMR is made visible.
+function ODMR_OpeningFcn(hObject, eventdata, handles, varargin)
+% Create NI session and add one single-ended AI channel (Dev1/ai0).
+handles.d = daq.createSession('ni');
+ch = addAnalogInputChannel(handles.d,'Dev1',0,'Voltage');
+ch.Range = [-10 10];
+
+% Open TCP/IP session to MW signal generator (SCPI over 5025).
+handles.s = tcpip('134.74.27.145',5025);
+handles.s.Timeout    = 5;     % avoid long blocking
+handles.s.Terminator = 'LF';  % common SCPI line ending
+fopen(handles.s);
+fprintf(handles.s, ':OUTP:STAT OFF');  % ensure MW OFF at start
+
+% Keep a line handle for efficient plotting (update YData only).
+handles.hLine = [];
+
+% Default command-line output for the GUI.
+handles.output = hObject;
+guidata(hObject, handles);
+
+
+% --- Outputs from this function are returned to the command line.
+function varargout = ODMR_OutputFcn(hObject, eventdata, handles) 
+varargout{1} = handles.output;
+
+
+% --- Executes when user attempts to close the figure.
+function figure1_CloseRequestFcn(hObject, eventdata, handles)
+% Turn MW OFF and close TCP/IP gracefully; release DAQ session.
+try
+    if isfield(handles,'s') && ~isempty(handles.s) && strcmp(handles.s.Status,'open')
+        fprintf(handles.s,':OUTP:STAT OFF');
+        fclose(handles.s);
+    end
+catch
+end
+try
+    if isfield(handles,'s') && ~isempty(handles.s)
+        delete(handles.s);
+    end
+catch
+end
+try
+    if isfield(handles,'d') && ~isempty(handles.d)
+        release(handles.d);
+    end
+catch
+end
+delete(hObject);
+
+
+
+function StartFreq_Callback(hObject, eventdata, handles)
+function StartFreq_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
+
+function EndFreq_Callback(hObject, eventdata, handles)
+function EndFreq_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
+
+function Step_Callback(hObject, eventdata, handles)
+function Step_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
+
+function Power_Callback(hObject, eventdata, handles)
+function Power_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
+
+
+% ===================== Main: Start button =====================
+function Start_Callback(hObject, eventdata, handles)
+% Clear stop flag at run start.
+set(handles.Stop,'Value',0);
+
+% ===== DAQ configuration (use Rate + DurationInSeconds) =====
+handles.nos = str2double(get(handles.No_of_samples,'String')); % samples per point
+handles.sr  = str2double(get(handles.Sampling_rate,'String')); % Hz
+handles.st  = handles.nos/handles.sr;                          % seconds per window
+set(handles.Sampling_time,'String',handles.st);
+
+handles.d.Rate = handles.sr;
+handles.d.DurationInSeconds = handles.nos/handles.sr;   % one blocking window
+
+% ===== Frequency plan =====
+SF_str = get(handles.StartFreq,'String');
+EF_str = get(handles.EndFreq,'String');
+Stp_str= get(handles.Step,'String');
+
+SF  = str2double(SF_str);
+EF  = str2double(EF_str);
+Stp = str2double(Stp_str);
+
+% Include start frequency as the first point (sample at start before stepping).
+freq = SF:Stp:EF;
+N    = numel(freq);
+
+% Averages (number of repeats of the entire sweep).
+M = str2double(get(handles.Average,'String'));
+
+% ===== MW source configuration with dwell =====
+% Dwell time per point (seconds) for frequency stabilization.
+dwellSec = 0.02;  % adjust per your hardware settling
+
+fprintf(handles.s,':SOUR:SWE:RES:ALL');      % reset sweep
+fprintf(handles.s,':SOUR:FREQ:MODE SWE');    % sweep mode
+fprintf(handles.s,[':SOUR:FREQ:STAR ' SF_str 'MHz']);
+fprintf(handles.s,[':SOUR:FREQ:STOP ' EF_str 'MHz']);
+fprintf(handles.s,[':SOUR:SWE:STEP ' Stp_str 'MHz']);
+fprintf(handles.s, sprintf(':SOUR:SWE:DWEL %g', dwellSec)); % dwell at each point
+
+% Single trigger source for stepping one point per *TRG (check your instrument).
+fprintf(handles.s,'TRIG:SWE:SOUR SING');
+
+% Explicit power unit (dBm).
+fprintf(handles.s, [':SOUR:POW ' get(handles.Power,'String') ' dBm']);
+
+% Turn MW ON and give some time to settle globally.
+fprintf(handles.s, ':OUTP:STAT ON');
+pause(1);
+
+% ===== Data buffers =====
+data_m  = zeros(M,N);  % raw value per average and per frequency point
+data_av = zeros(1,N);  % running average curve
+set(handles.Contrast,'String','0');
+
+% ===== Plot (efficient YData-only updates) =====
+if isempty(handles.hLine) || ~ishandle(handles.hLine)
+    axes(handles.plot1);
+    yInit = nan(1,N);  % NaNs so MATLAB ignores them in autoscale if needed
+    handles.hLine = plot(freq, yInit, 'b*-'); % full X pre-created
+    xlabel('Frequency (MHz)');
+    ylabel('Voltage (V)');
+    grid on;
+end
+guidata(hObject, handles);
+
+% ===== Outer loop over averages =====
+for m = 1:M
+    set(handles.Current_average,'String',m);
+    drawnow;
+
+    % ----- First point (start frequency): do NOT step; just wait then sample -----
+    Check = get(handles.Stop,'Value');
+    if Check==1, break; end
+
+    pause(dwellSec);                             % allow start freq to stabilize
+    data = handles.d.startForeground();          % blocking acquisition window
+    val  = mean(data);                           % per-point value = time mean
+
+    data_m(m,1) = val;
+    if m==1
+        data_av(1) = val;
+    else
+        data_av(1) = ((m-1)*data_av(1) + val)/m; % running average
+    end
+
+    % Update only YData (first point).
+    yShow = get(handles.hLine,'YData');
+    if all(isnan(yShow)), yShow = nan(1,N); end
+    yShow(1) = data_av(1);
+    set(handles.hLine,'YData', yShow);
+    drawnow limitrate;
+
+    % ----- Subsequent points: step one point per *TRG, dwell, then sample -----
+    for n = 2:N
+        Check = get(handles.Stop,'Value');
+        if Check==1, break; end
+
+        fprintf(handles.s, '*TRG');              % advance to next point
+        pause(dwellSec);                         % stabilization dwell
+
+        data = handles.d.startForeground();      % blocking acquisition window
+        val  = mean(data);                       % time-domain mean
+        data_m(m,n) = val;
+
+        if m==1
+            data_av(n) = val;
+        else
+            data_av(n) = ((m-1)*data_av(n) + val)/m;
+        end
+
+        % Efficient plotting: update only the nth Y value.
+        yShow(n) = data_av(n);
+        set(handles.hLine,'YData', yShow);
+        drawnow limitrate;
+    end
+
+    % Update contrast readout (simple (max-min)/max in percent).
+    cont = round(100.*(max(data_av) - min(data_av))./max(data_av), 2);
+    if isfinite(cont), set(handles.Contrast,'String',cont); end
+
+    if Check==1, break; end
+end
+
+% Sweep finished: turn MW OFF.
+fprintf(handles.s, ':OUTP:STAT OFF');
+
+% Persist averaged curve in handles and save to file.
+handles.voltage = data_av;
+guidata(hObject, handles);
+
+SaveStructure.freq     = freq(:);
+SaveStructure.Voltage  = handles.voltage(:);
+SaveStructure.Data     = [freq(:), handles.voltage(:)];
+
+SaveStructure.ParamLabels = {'Start Freq. (MHz)','End Freq. (MHz)',...
+    'Freq. Step (MHz)','MW Power (dBm)','Averages','Dwell (s)',...
+    'Samples per point','Sample rate (Hz)'};
+
+SaveStructure.Parameters(1,1) = SF;
+SaveStructure.Parameters(1,2) = EF;
+SaveStructure.Parameters(1,3) = Stp;
+SaveStructure.Parameters(1,4) = str2double(get(handles.Power,'String'));
+SaveStructure.Parameters(1,5) = M;
+SaveStructure.Parameters(1,6) = dwellSec;
+SaveStructure.Parameters(1,7) = handles.nos;
+SaveStructure.Parameters(1,8) = handles.sr;
+
+outdir = 'D:\Data\Kang\charge injection\cw-PDMR';
+if ~exist(outdir,'dir'), mkdir(outdir); end
+outfile = fullfile(outdir, ['ODMR_contrast_' datestr(now,'yyyy-mm-dd_HHMMSS') '.mat']);
+save(outfile,'SaveStructure');
+
+
+% --- Executes during object creation, after setting all properties.
+function plot1_CreateFcn(hObject, eventdata, handles)
+% Plot axis is initialized in OpeningFcn/Start when drawing the first line.
+
+
+function Average_Callback(hObject, eventdata, handles)
+function Average_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
+
+
+function No_of_samples_Callback(hObject, eventdata, handles)
+% Keep sampling-time label consistent with sample count and sampling rate.
+handles.nos=str2double(get(hObject,'String'));
+handles.sr=str2double(get(handles.Sampling_rate,'String'));
+handles.st=handles.nos/handles.sr;
+set(handles.Sampling_time,'String',handles.st)
+guidata(hObject, handles);
+
+function No_of_samples_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
+
+
+function Sampling_rate_Callback(hObject, eventdata, handles)
+% Keep sampling-time label consistent with sample count and sampling rate.
+handles.nos=str2double(get(handles.No_of_samples,'String'));
+handles.sr=str2double(get(hObject,'String'));
+handles.st=handles.nos/handles.sr;
+set(handles.Sampling_time,'String',handles.st)
+guidata(hObject, handles);
+
+function Sampling_rate_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
+
+
+function Stop_Callback(hObject, eventdata, handles)
+% Stop flag is polled inside Start_Callback loops.
+
+
+function Contrast_Callback(hObject, eventdata, handles)
+function Contrast_CreateFcn(hObject, eventdata, handles)
+if ispc && isequal(get(hObject,'BackgroundColor'), get(0,'defaultUicontrolBackgroundColor'))
+    set(hObject,'BackgroundColor','white');
+end
